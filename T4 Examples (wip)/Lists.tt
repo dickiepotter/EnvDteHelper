@@ -1,0 +1,34 @@
+﻿<#@ template debug="false" hostspecific="True" language="C#" #>
+<#@ assembly name="System.Core" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ output extension=".html" #>
+
+<# DTE Dte;#>
+<#@ include file="EnvDteHelper.ttinclude"#>
+
+<h1>Solution information for <#=SolutionName(Dte)#></h1>
+
+<h2>Project Files for this T4's parent project</h2>
+
+<ul>
+<#
+var project=GetProjectContainingT4File(Dte,false);
+ foreach(var pi in RecurseProjectItems(Dte, project))
+	{#>
+		<li><#=pi.Name#></li>
+	<#   
+}#>
+</ul>
+
+<h2>Project Files for this solution</h2>
+
+<ul>
+<#
+ foreach(var pi in RecurseSolutionItems(Dte))
+	{#>
+		<li><#=pi.Name#></li>
+	<#   
+}#>
+</ul>

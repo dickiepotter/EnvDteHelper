@@ -1,0 +1,509 @@
+﻿<#
+// --------------------------------------------------------------------------------------------------
+// <copyright file="oMapGen.tt">
+//   Copyright (c) 2014 All Rights Reserved
+// </copyright>
+// <license>
+//   This source code is subject to terms and conditions of the Microsoft Public License. A copy of
+//   the license can be found at http://omapgen.codeplex.com/license. If you cannot locate the  
+//   Microsoft Public License, please send an email to dlr@microsoft.com. By using this source code
+//   in any fashion, you are agreeing to be bound by the terms of the Microsoft Public License. You
+//   must not remove this notice, or any other, from this software.
+// </license>
+// <author>Mathieu Guillemain</author>
+// <date>23/04/2014</date>
+// <version>0.3</version>
+// --------------------------------------------------------------------------------------------------
+#>
+<#@ assembly name="System.Core" #>
+<#@ import namespace="System.CodeDom.Compiler" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ import namespace="System.IO" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Reflection" #>
+<#@ import namespace="Microsoft.CSharp" #>
+<#+
+    public class oMapGen
+    {
+        #region fields
+        private Action<string> _codeWriter;
+        private Action<string> _traceWriter;
+        private Assembly _srcAssembly;
+        private Assembly _dstAssembly;
+        private int _indexNumber = 1;
+        #endregion
+
+        #region properties
+        public bool EnableFieldMapping { get; set; }
+        public bool DisableEmptyMappingCheck { get; set; }
+        public bool DisableMappingFailureTrace { get; set; }
+        public bool ForceDefaultToNullMapping { get; set; }
+        public bool ForceStronglyTypedMapping { get; set; }
+        public bool ForceCloning { get; set; }
+        #endregion
+
+        #region constructors
+        public oMapGen() { }
+
+        public oMapGen(string[] srcCSFileNames, string[] dstCSFileNames, string[] additionalAssemblyNames = null)
+        {
+            var assemblyNames = new List<string>(new string[] { "System.dll", "System.Core.dll" });
+            if (null != additionalAssemblyNames)
+                assemblyNames.AddRange(additionalAssemblyNames);
+            var parameters = new CompilerParameters(assemblyNames.ToArray())
+            {
+                GenerateExecutable = false,
+                IncludeDebugInformation = false,
+                GenerateInMemory = true
+            };
+            var csProvider = new CSharpCodeProvider();
+            var srcResults = csProvider.CompileAssemblyFromFile(parameters, srcCSFileNames);
+            var dstResults = csProvider.CompileAssemblyFromFile(parameters, dstCSFileNames);
+
+            if (srcResults.Errors.HasErrors || dstResults.Errors.HasErrors)
+            {
+                var errorMessage = "The compiler returned the following errors:\n";
+                foreach (CompilerError error in srcResults.Errors)
+                    errorMessage += "\t"+error.ErrorText+"\n";
+                foreach (CompilerError error in dstResults.Errors)
+                    errorMessage += "\t"+error.ErrorText+"\n";
+                throw new Exception(errorMessage);
+            }
+            _srcAssembly = srcResults.CompiledAssembly;
+            _dstAssembly = dstResults.CompiledAssembly;
+        }
+
+        public oMapGen(string srcAssemblyName, string dstAssemblyName)
+        {
+            _srcAssembly = Assembly.Load(new AssemblyName(srcAssemblyName));
+            _dstAssembly = Assembly.Load(new AssemblyName(dstAssemblyName));
+        }
+        #endregion
+
+        #region generators
+        public void Generate(Type srcType, Type dstType, Action<string> codeWriter, Action<string> traceWriter, bool withBackwardInjection = false)
+        {
+            _codeWriter = codeWriter;
+            _traceWriter = traceWriter;
+
+            if (_srcAssembly == null)
+                _srcAssembly = srcType.Assembly;
+            if (_dstAssembly == null)
+                _dstAssembly = dstType.Assembly;
+
+            _codeWriter.Invoke("//oMapGen auto-generated mapping method from "+srcType.Name+" to "+dstType.Name);
+            //TODO generate method accessibility based on objects'
+            _codeWriter.Invoke("public static "+convertTypeToString(dstType)+" To"+dstType.Name+"(this "+convertTypeToString(srcType)+" srcObj)");
+            _codeWriter.Invoke("{");
+            _codeWriter.Invoke(convertTypeToString(dstType)+" dstObj"+(isNullable(dstType)?"=null":"")+";");
+            generate("srcObj", srcType, "dstObj", dstType, _codeWriter);
+            _codeWriter.Invoke("return dstObj;");
+            _codeWriter.Invoke("}");
+
+            if (withBackwardInjection) //we just need to swap the source/destination assemblies/types then regenerate
+            {
+                var temp = _srcAssembly;
+                _srcAssembly = _dstAssembly;
+                _dstAssembly = temp;
+
+                _codeWriter.Invoke("//oMapGen auto-generated mapping injection method from "+dstType.Name+" to "+srcType.Name);
+                //TODO generate method accessibility based on objects'
+                _codeWriter.Invoke("public static "+convertTypeToString(srcType)+" From(this "+convertTypeToString(srcType)+" dstObj,"+convertTypeToString(dstType)+" srcObj)");
+                _codeWriter.Invoke("{");
+                //TODO? add injection parameter to keep already instanciated classes
+                generate("srcObj", dstType, "dstObj", srcType, _codeWriter, false);
+                _codeWriter.Invoke("return dstObj;");
+                _codeWriter.Invoke("}");
+            }
+        }
+
+        public void Generate(string srcTypeName, string dstTypeName, Action<string> codeWriter, Action<string> traceWriter, bool withBackwardInjection = false)
+        {
+            if (null == _srcAssembly)
+            {
+                traceWriter.Invoke("ERROR: no source assembly loaded");
+                return;
+            }
+            var srcType = _srcAssembly.GetType(srcTypeName);
+            if (null == srcType)
+            {
+                traceWriter.Invoke("ERROR: cannot find type "+srcTypeName);
+                return;
+            }
+
+            if (null == _dstAssembly)
+            {
+                traceWriter.Invoke("ERROR: no destination assembly loaded");
+                return;
+            }
+            var dstType = _dstAssembly.GetType(dstTypeName);
+            if (null == dstType)
+            {
+                traceWriter.Invoke("ERROR: cannot find type "+dstTypeName);
+                return;
+            }
+            Generate(srcType, dstType, codeWriter, traceWriter, withBackwardInjection);
+        }
+
+        private bool generate(string srcName, Type srcType, string dstName, Type dstType, Action<string> _codeWriter, bool instanciateDst = true)
+        {
+            if (dstType.IsAssignableFrom(srcType) &&
+                (!ForceStronglyTypedMapping || typeof(System.Object) != dstType) &&
+                (!ForceDefaultToNullMapping || !isNullable(dstType) || isNullable(srcType) && isNullable(dstType)) &&
+                (!ForceCloning || typeof(System.String) == dstType || dstType.IsValueType && !isKeyValuePair(dstType)))
+                _codeWriter.Invoke(dstName+"="+srcName+";");
+            
+            else if (srcType.IsEnum && dstType.IsEnum || srcType.IsEnum && isNumeric(dstType, true) ||
+                isNumeric(srcType) && dstType.IsEnum || isNumeric(srcType) && isNumeric(dstType, true))
+                _codeWriter.Invoke(dstName+"=("+convertTypeToString(dstType)+")"+srcName+";");
+            
+            else if (typeof(System.Boolean) == srcType && isNumeric(dstType))
+                _codeWriter.Invoke(dstName+"=("+srcName+")?1:0;");
+            
+            else if (isNumeric(srcType) && typeof(System.Boolean) == dstType)
+                _codeWriter.Invoke(dstName+"=(0!="+srcName+");");
+            
+            else if ((isNullableEnum(srcType) || isNullable(srcType) && isNumeric(srcType, true)) && dstType.IsEnum ||
+                isNullable(srcType) && isNumeric(srcType, true) && isNumeric(dstType))
+                _codeWriter.Invoke(dstName+"=(null!="+srcName+")?("+convertTypeToString(dstType)+")"+srcName+":("+convertTypeToString(dstType)+")0;");
+            
+            else if (typeof(Nullable<System.Boolean>) == srcType && typeof(System.Boolean) == dstType)
+                _codeWriter.Invoke(dstName+"="+srcName+"??false;");
+            
+            else if (typeof(Nullable<System.DateTime>) == srcType && typeof(System.DateTime) == dstType ||
+                typeof(Nullable<System.TimeSpan>) == srcType && typeof(System.TimeSpan) == dstType)
+                _codeWriter.Invoke(dstName+"=(null!="+srcName+")?("+convertTypeToString(dstType)+")"+srcName+":"+convertTypeToString(dstType)+".MinValue;");
+            
+            else if (typeof(System.Boolean) == srcType && typeof(Nullable<System.Boolean>) == dstType) //ForceDefaultToNullMapping
+                _codeWriter.Invoke(dstName+"=("+srcName+")?(System.Nullable<System.Boolean>)"+srcName+":null;");
+            
+            //TODO apply ForceDefaultToNullMapping to enums and numerics
+            else if (typeof(System.DateTime) == srcType && typeof(Nullable<System.DateTime>) == dstType ||
+                typeof(System.TimeSpan) == srcType && typeof(Nullable<System.TimeSpan>) == dstType) //ForceDefaultToNullMapping
+                _codeWriter.Invoke(dstName+"=("+convertTypeToString(srcType)+".MinValue=="+srcName+")?("+convertTypeToString(dstType)+")"+srcName+":null;");
+            
+            else if (isKeyValuePair(srcType) && isKeyValuePair(dstType))
+            {
+                var srcElementTypes = srcType.GetGenericArguments();
+                var dstElementTypes = dstType.GetGenericArguments();
+                var dstElementFirstName = "dstElementFirst"+(_indexNumber);
+                var dstElementSecondName = "dstElementSecond"+(_indexNumber++);
+                _codeWriter.Invoke(convertTypeToString(dstElementTypes[0])+" "+dstElementFirstName+(isNullable(dstElementTypes[0]) ? "=null" : "")+";");
+                generate(srcName+".Key", srcElementTypes[0], dstElementFirstName, dstElementTypes[0], _codeWriter);
+                _codeWriter.Invoke(convertTypeToString(dstElementTypes[1])+" "+dstElementSecondName+(isNullable(dstElementTypes[1]) ? "=null" : "")+";");
+                generate(srcName+".Value", srcElementTypes[1], dstElementSecondName, dstElementTypes[1], _codeWriter);
+                _codeWriter.Invoke(dstName+" = new "+convertTypeToString(dstType)+"("+dstElementFirstName+", "+dstElementSecondName+");");
+            }
+            else if (isEnumerable(srcType) && isCollection(dstType))
+            {
+                var srcElementTypes = srcType.GetGenericArguments();
+                var dstElementTypes = dstType.GetGenericArguments();
+                if (srcElementTypes.Length == dstElementTypes.Length)
+                {
+                    switch (srcElementTypes.Length)
+                    {
+                        case 0: //arrays
+                            if (!DisableEmptyMappingCheck && !generate("", srcType.GetElementType(), "", dstType.GetElementType(), x => {}))
+                            {
+                                traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible collections content");
+                                return false;
+                            }
+                            generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                            _codeWriter.Invoke(dstName+"=new "+convertTypeToString(dstType.GetElementType())+"["+srcName+".Length];");
+                            var indexName = "i"+(_indexNumber++);
+                            _codeWriter.Invoke("for(int "+indexName+"=0;"+indexName+"<"+srcName+".Length;"+indexName+"++)");
+                            _codeWriter.Invoke("{");
+                            generate(srcName+"["+indexName+"]", srcType.GetElementType(), dstName+"["+indexName+"]", dstType.GetElementType(), _codeWriter);
+                            _codeWriter.Invoke("}");
+                            generateInstanciateEnd(_codeWriter, instanciateDst);
+                            break;
+                        case 1: //lists
+                            if (!DisableEmptyMappingCheck && !generate("", srcElementTypes[0], "", dstElementTypes[0], x => {}))
+                            {
+                                traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible collections content");
+                                return false;
+                            }
+                            generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                            var srcElementName = "srcElement"+(_indexNumber);
+                            var dstElementName = "dstElement"+(_indexNumber++);
+                            _codeWriter.Invoke("foreach("+convertTypeToString(srcElementTypes[0])+" "+srcElementName+" in "+srcName+")");
+                            _codeWriter.Invoke("{");
+                            _codeWriter.Invoke(convertTypeToString(dstElementTypes[0])+" "+dstElementName+(isNullable(dstElementTypes[0]) ? "=null" : "")+";");
+                            generate(srcElementName, srcElementTypes[0], dstElementName, dstElementTypes[0], _codeWriter);
+                            _codeWriter.Invoke(dstName+".Add("+dstElementName+");");
+                            _codeWriter.Invoke("}");
+                            generateInstanciateEnd(_codeWriter, instanciateDst);
+                            break;
+                        case 2: //dictionaries
+                            if (!DisableEmptyMappingCheck && (!generate("", srcElementTypes[0], "", dstElementTypes[0], x => {}) ||
+                                !generate("", srcElementTypes[1], "", dstElementTypes[1], x => {})))
+                            {
+                                traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible collections content");
+                                return false;
+                            }
+                            generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                            srcElementName = "srcElement"+(_indexNumber);
+                            var dstElementFirstName = "dstElementFirst"+(_indexNumber);
+                            var dstElementSecondName = "dstElementSecond"+(_indexNumber++);
+                            _codeWriter.Invoke("foreach(System.Collections.Generic.KeyValuePair<"+convertTypeToString(srcElementTypes[0])+","+convertTypeToString(srcElementTypes[1])+"> "+srcElementName+" in "+srcName+")");
+                            _codeWriter.Invoke("{");
+                            _codeWriter.Invoke(convertTypeToString(dstElementTypes[0])+" "+dstElementFirstName+(isNullable(dstElementTypes[0]) ? "=null" : "")+";");
+                            generate(srcElementName+".Key", srcElementTypes[0], dstElementFirstName, dstElementTypes[0], _codeWriter);
+                            _codeWriter.Invoke(convertTypeToString(dstElementTypes[1])+" "+dstElementSecondName+(isNullable(dstElementTypes[1]) ? "=null" : "")+";");
+                            generate(srcElementName+".Value", srcElementTypes[1], dstElementSecondName, dstElementTypes[1], _codeWriter);
+                            _codeWriter.Invoke(dstName+".Add("+dstElementFirstName+", "+dstElementSecondName+");");
+                            _codeWriter.Invoke("}");
+                            generateInstanciateEnd(_codeWriter, instanciateDst);
+                            break;
+                        default:
+                            traceMappingIssue(srcName, srcType, dstName, dstType, "collections with more than 2 generics are not handled");
+                            return false;
+                    }
+                }
+                else if (0 == srcElementTypes.Length && 1 == dstElementTypes.Length) //array to list
+                {
+                    if (!DisableEmptyMappingCheck && !generate("", srcType.GetElementType(), "", dstElementTypes[0], x => {}))
+                    {
+                        traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible collections content");
+                        return false;
+                    }
+                    generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                    var srcElementName = "srcElement"+(_indexNumber);
+                    var dstElementName = "dstElement"+(_indexNumber++);
+                    _codeWriter.Invoke("foreach("+convertTypeToString(srcType.GetElementType())+" "+srcElementName+" in "+srcName+")");
+                    _codeWriter.Invoke("{");
+                    _codeWriter.Invoke(convertTypeToString(dstElementTypes[0])+" "+dstElementName+(isNullable(dstElementTypes[0]) ? "=null" : "")+";");
+                    generate(srcElementName, srcType.GetElementType(), dstElementName, dstElementTypes[0], _codeWriter);
+                    _codeWriter.Invoke(dstName+".Add("+dstElementName+");");
+                    _codeWriter.Invoke("}");
+                    generateInstanciateEnd(_codeWriter, instanciateDst);
+                }
+                else if (1 == srcElementTypes.Length && 0 == dstElementTypes.Length) //list to array
+                {
+                    if (!DisableEmptyMappingCheck && !generate("", srcElementTypes[0], "", dstType.GetElementType(), x => {}))
+                    {
+                        traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible collections content");
+                        return false;
+                    }
+                    generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                    var srcElementName = "srcElement"+(_indexNumber++);
+                    _codeWriter.Invoke(dstName+"=new "+convertTypeToString(dstType.GetElementType())+"["+srcName+".Count];");
+                    var indexName = "i"+(_indexNumber++);
+                    _codeWriter.Invoke("int "+indexName+"=0;");
+                    _codeWriter.Invoke("foreach("+convertTypeToString(srcElementTypes[0])+" "+srcElementName+" in "+srcName+")");
+                    _codeWriter.Invoke("{");
+                    generate(srcElementName, srcElementTypes[0], dstName+"["+indexName+"]", dstType.GetElementType(), _codeWriter);
+                    _codeWriter.Invoke(indexName+"++;");
+                    _codeWriter.Invoke("}");
+                    generateInstanciateEnd(_codeWriter, instanciateDst);
+                }
+                //TODO map dictionary to array/list of pairs and vice versa
+                else
+                {
+                    traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible collections");
+                    return false;
+                }
+            }
+            else if (srcType.IsInterface && dstType.IsInterface)
+            {
+                var isFirstMapped = false;
+
+                //we map all implementations with matching base name (convention choice)
+                var srcImplAssembly = _srcAssembly ?? srcType.Assembly;
+                var srcImplTypes = srcImplAssembly.GetTypes().Where(type => !type.IsInterface && srcType != type && srcType.IsAssignableFrom(type));
+                var dstImplAssembly = _dstAssembly ?? dstType.Assembly;
+                var dstImplTypes = dstImplAssembly.GetTypes().Where(type => !type.IsInterface && dstType != type && dstType.IsAssignableFrom(type));
+                foreach (var implType in srcImplTypes.Join(dstImplTypes, s => s.ToString().Split('.').Last(), d => d.ToString().Split('.').Last(), (s, d) => new { Src = s, Dst = d }))
+                {
+                    if (!DisableEmptyMappingCheck && !generate(srcName, implType.Src, srcName, implType.Dst, x => {}))
+                        continue;
+
+                    _codeWriter.Invoke((isFirstMapped?"else ":"")+"if(null!="+srcName+"&&"+srcName+".GetType()==typeof("+convertTypeToString(implType.Src)+"))");
+                    _codeWriter.Invoke("{");
+                    _codeWriter.Invoke(dstName+"=new "+implType.Dst+"();");
+                    generate("(("+implType.Src+")"+srcName+")", implType.Src, "(("+convertTypeToString(implType.Dst)+")"+dstName+")", implType.Dst, _codeWriter, false);
+                    _codeWriter.Invoke("}");
+                    isFirstMapped = true;
+                }
+                if (!isFirstMapped)
+                {
+                    traceMappingIssue(srcName, srcType, dstName, dstType, "no compatible implemented types");
+                    return false;
+                }
+            }
+            else if (srcType.IsInterface && dstType.IsClass || srcType.IsClass && dstType.IsInterface)
+            {
+                traceMappingIssue(srcName, srcType, dstName, dstType, "interface-to-class and class-to-interface are not handled");
+                return false;
+                //TODO
+            }
+            else// if (srcType.IsClass && dstType.IsClass)
+            {
+                var isFirstMapped = false;
+
+                //we map all accessible matching properties including non public ones
+                var srcProperties = srcType.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(p => p.CanRead);
+                var dstProperties = dstType.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(p => p.CanWrite);
+                foreach (var match in srcProperties.Join(dstProperties, s => s.Name, d => d.Name, (s, d) => new { Src = s, Dst = d }))
+                {
+                    if (!DisableEmptyMappingCheck && !generate(match.Src.Name, match.Src.PropertyType, match.Dst.Name, match.Dst.PropertyType, x => {}))
+                        continue;
+
+                    if (!isFirstMapped)
+                    {
+                        generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                        isFirstMapped = true;
+                    }
+                    generate(srcName+"."+match.Src.Name, match.Src.PropertyType, dstName+"."+match.Dst.Name, match.Dst.PropertyType, _codeWriter);
+                }
+
+                if (EnableFieldMapping)
+                {
+                    //we do the same for accessible matching fields...
+                    var srcFields = srcType.GetFields(BindingFlags.Instance | BindingFlags.Public);
+                    var dstFields = dstType.GetFields(BindingFlags.Instance | BindingFlags.Public);
+                    foreach (var match in srcFields.Join(dstFields, s => s.Name, d => d.Name, (s, d) => new { Src = s, Dst = d }))
+                    {
+                        if (!DisableEmptyMappingCheck && !generate(match.Src.Name, match.Src.FieldType, match.Dst.Name, match.Dst.FieldType, x => {}))
+                            continue;
+
+                        if (!isFirstMapped)
+                        {
+                            generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                            isFirstMapped = true;
+                        }
+                        generate(srcName+"."+match.Src.Name, match.Src.FieldType, dstName+"."+match.Dst.Name, match.Dst.FieldType, _codeWriter);
+                    }
+                    //... and accessible fields matching properties
+                    foreach (var match in srcFields.Join(dstProperties, s => s.Name, d => d.Name, (s, d) => new { Src = s, Dst = d }))
+                    {
+                        if (!DisableEmptyMappingCheck && !generate(match.Src.Name, match.Src.FieldType, match.Dst.Name, match.Dst.PropertyType, x => {}))
+                            continue;
+
+                        if (!isFirstMapped)
+                        {
+                            generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                            isFirstMapped = true;
+                        }
+                        generate(srcName+"."+match.Src.Name, match.Src.FieldType, dstName+"."+match.Dst.Name, match.Dst.PropertyType, _codeWriter);
+                    }
+                    //... and accessible properties matching fields
+                    foreach (var match in srcProperties.Join(dstFields, s => s.Name, d => d.Name, (s, d) => new { Src = s, Dst = d }))
+                    {
+                        if (!DisableEmptyMappingCheck && !generate(match.Src.Name, match.Src.PropertyType, match.Dst.Name, match.Dst.FieldType, x => {}))
+                            continue;
+
+                        if (!isFirstMapped)
+                        {
+                            generateInstanciateBegin(srcType, dstType, srcName, dstName, _codeWriter, ref instanciateDst);
+                            isFirstMapped = true;
+                        }
+                        generate(srcName+"."+match.Src.Name, match.Src.PropertyType, dstName+"."+match.Dst.Name, match.Dst.FieldType, _codeWriter);
+                    }
+                }
+                if (isFirstMapped)
+                    generateInstanciateEnd(_codeWriter, instanciateDst);
+                else
+                {
+                    //traceMappingIssue(srcName, srcType, dstName, dstType, "no property "+EnableFieldMapping ? "nor field" : "" +" to map");
+                    traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible types");
+                    return false;
+                }
+            }
+            //else
+            //{
+            //    traceMappingIssue(srcName, srcType, dstName, dstType, "incompatible types");
+            //    return false;
+            //}
+            return true;
+        }
+
+        private void generateInstanciateBegin(Type srcType, Type dstType, string srcName, string dstName, Action<string> _codeWriter, ref bool instanciateDst)
+        {
+            instanciateDst &= (isNullable(srcType) && !dstType.IsAbstract);
+            if (instanciateDst)
+            {    
+                _codeWriter.Invoke("if(null!="+srcName+")");
+                _codeWriter.Invoke("{");
+                if (null != dstType.GetConstructor(Type.EmptyTypes))
+                    _codeWriter.Invoke(dstName+"=new "+convertTypeToString(dstType)+"();");
+            }
+        }
+
+        private void generateInstanciateEnd(Action<string> _codeWriter, bool instanciateDst)
+        {
+            if (instanciateDst)
+                _codeWriter.Invoke("}");
+        }
+        #endregion
+
+        #region helper methods
+        private bool isNullable(Type type)
+        {
+            return type.IsClass || type.IsInterface || type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>);
+        }
+
+        private bool isNullableEnum(Type type)
+        {
+            var uType = Nullable.GetUnderlyingType(type);
+            return null != uType && uType.IsEnum;
+        }
+
+        private bool isCollection(Type type)
+        {
+            return type.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(ICollection<>));
+        }
+
+        private bool isEnumerable(Type type)
+        {
+            return type.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IEnumerable<>));
+        }
+
+        private bool isNumeric(Type type, bool isNullableOK = false)
+        {
+            if (type == null)
+                return false;
+
+            switch (Type.GetTypeCode(type))
+            {
+                case TypeCode.Byte:
+                case TypeCode.Decimal:
+                case TypeCode.Double:
+                case TypeCode.Int16:
+                case TypeCode.Int32:
+                case TypeCode.Int64:
+                case TypeCode.SByte:
+                case TypeCode.Single:
+                case TypeCode.UInt16:
+                case TypeCode.UInt32:
+                case TypeCode.UInt64:
+                    return true;
+                case TypeCode.Object:
+                    if (isNullableOK && isNullable(type))
+                        return isNumeric(Nullable.GetUnderlyingType(type));
+                    return false;
+            }
+            return false;
+        }
+
+        private bool isKeyValuePair(Type type)
+        {
+            return type.IsGenericType && typeof(System.Collections.Generic.KeyValuePair<,>) == type.GetGenericTypeDefinition();
+        }
+
+        private string convertTypeToString(Type type)
+        {
+            if (type.IsGenericType)
+                //return type.ToString().Replace("`"+type.GetGenericArguments().Length+"[","<").Replace("]", ">");
+                return type.ToString().Replace("`1[","<").Replace("`2[","<").Replace("]", ">");
+            return type.ToString();
+        }
+
+        private void traceMappingIssue(string srcName, Type srcType, string dstName, Type dstType, string reason)
+        {
+            if (!DisableMappingFailureTrace)
+                _traceWriter.Invoke((_traceWriter == _codeWriter ? "//" : "")+"WARNING: cannot map ("+convertTypeToString(srcType)+")"+srcName+" to ("+convertTypeToString(dstType)+")"+dstName+": "+reason);
+        }
+        #endregion
+    }
+#>
